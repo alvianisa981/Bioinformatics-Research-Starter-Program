@@ -1,0 +1,173 @@
+#Modul: Analisis Ekspresi Gen Kanker Paru 
+#Dataset: GSE19804 (Lung Cancer vs Normal)
+#Platform: Microarray (Affymetrix GPL96)
+#Tujuan: Mengidentifikasi Differentially Expressed Genes (DEG) 
+
+#PART B. PERSIAPAN LINGKUNGAN KERJA (INSTALL & LOAD PACKAGE) 
+
+if (!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager") 
+}
+
+# Install paket Bioconductor
+BiocManager::install(c("GEOquery", "limma", "hgu133a.db", "AnnotationDbi", "clusterProfiler", "org.Hs.eg.db"), ask = FALSE, update = FALSE) 
+
+# Install paket CRAN
+install.packages(c("pheatmap", "ggplot2", "dplyr", "umap"))
+
+# Memanggil library 
+library(GEOquery)
+library(limma)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(hgu133a.db)
+library(AnnotationDbi)
+library(umap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+#PART C. PENGAMBILAN DATA DARI GEO 
+
+# Mengunduh dataset GSE19804
+gset <- getGEO("GSE19804", GSEMatrix = TRUE, AnnotGPL = TRUE)[[1]]
+
+#PART D. PRE-PROCESSING DATA EKSPRESI 
+
+ex <- exprs(gset)
+
+# Cek Log2 transformasi
+qx <- as.numeric(quantile(ex, c(0, 0.25, 0.5, 0.75, 0.99, 1), na.rm = TRUE))
+LogTransform <- (qx[5] > 100) || (qx[6] - qx[1] > 50 && qx[2] > 0)
+
+if (LogTransform) {
+  ex[ex <= 0] <- NA
+  ex <- log2(ex + 1)
+}
+
+# Membersihkan data dari variansi nol (Penting agar tidak error eBayes)
+ex <- ex[apply(ex, 1, var) > 0, ]
+
+#PART E. DEFINISI KELOMPOK SAMPEL 
+
+# Pada GSE19804, status sampel ada di kolom 'title'
+group_info <- pData(gset)[["title"]]
+
+# Klasifikasi: Sampel yang mengandung kata "Normal" jadi grup Normal, sisanya Cancer
+groups <- ifelse(grepl("Normal", group_info), "Normal", "Cancer")
+gset$group <- factor(groups)
+
+nama_grup <- levels(gset$group)
+print(paste("Grup yang ditemukan:", paste(nama_grup, collapse = ", ")))
+
+#PART F. DESIGN MATRIX (KERANGKA STATISTIK) 
+
+design <- model.matrix(~0 + gset$group)
+colnames(design) <- levels(gset$group)
+
+# Menentukan perbandingan (Cancer vs Normal)
+contrast_formula <- "Cancer-Normal"
+print(paste("Kontras yang dianalisis:", contrast_formula))
+
+#PART G. ANALISIS DIFFERENTIAL EXPRESSION (LIMMA)
+
+fit <- lmFit(ex, design)
+contrast_matrix <- makeContrasts(contrasts = contrast_formula, levels = design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+# Mengambil hasil DEG (p-value 0.05 agar lebih inklusif)
+topTableResults <- topTable(
+  fit2,
+  adjust = "fdr",
+  sort.by = "B",
+  number = Inf,
+  p.value = 0.05
+)
+
+#PART H. ANOTASI NAMA GEN 
+
+probe_ids <- rownames(topTableResults)
+
+gene_annotation <- AnnotationDbi::select(
+  hgu133a.db,
+  keys = probe_ids,
+  columns = c("SYMBOL", "GENENAME", "ENTREZID"),
+  keytype = "PROBEID"
+)
+
+topTableResults$PROBEID <- rownames(topTableResults)
+topTableResults <- merge(topTableResults, gene_annotation, by = "PROBEID", all.x = TRUE)
+
+#PART I.1 BOXPLOT DISTRIBUSI NILAI EKSPRESI 
+
+group_colors <- as.numeric(gset$group)
+boxplot(ex, col = group_colors, las = 2, outline = FALSE, 
+        main = "Boxplot Distribusi Ekspresi GSE19804", ylab = "log2 Expression")
+
+#PART I.2 DISTRIBUSI NILAI EKSPRESI (DENSITY PLOT) 
+
+expr_long <- data.frame(Expression = as.vector(ex), 
+                        Group = rep(gset$group, each = nrow(ex)))
+
+ggplot(expr_long, aes(x = Expression, color = Group)) +
+  geom_density(linewidth = 1) + theme_minimal() +
+  labs(title = "Density Plot Ekspresi Gen", x = "log2 Expression")
+
+#PART I.3 UMAP (VISUALISASI DIMENSI RENDAH)
+
+umap_input <- t(ex)
+umap_result <- umap(umap_input)
+umap_df <- data.frame(UMAP1 = umap_result$layout[,1], 
+                      UMAP2 = umap_result$layout[,2], Group = gset$group)
+
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 3, alpha = 0.7) + theme_minimal() +
+  labs(title = "UMAP Plot: Cancer vs Normal")
+
+#PART J.1 VISUALISASI VOLCANO PLOT 
+
+volcano_data <- topTableResults
+volcano_data$status <- "NO"
+volcano_data$status[volcano_data$logFC > 1 & volcano_data$adj.P.Val < 0.05] <- "UP"
+volcano_data$status[volcano_data$logFC < -1 & volcano_data$adj.P.Val < 0.05] <- "DOWN"
+
+ggplot(volcano_data, aes(x = logFC, y = -log10(adj.P.Val), color = status)) +
+  geom_point(alpha = 0.4) +
+  scale_color_manual(values = c("DOWN" = "blue", "NO" = "grey", "UP" = "red")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() + ggtitle("Volcano Plot GSE19804")
+
+#PART J.2 VISUALISASI HEATMAP 
+
+top50 <- head(topTableResults[order(topTableResults$adj.P.Val), ], 50)
+mat_heatmap <- ex[top50$PROBEID, ]
+rownames(mat_heatmap) <- ifelse(is.na(top50$SYMBOL), top50$PROBEID, top50$SYMBOL)
+
+annotation_col <- data.frame(Group = gset$group)
+rownames(annotation_col) <- colnames(mat_heatmap)
+
+pheatmap(mat_heatmap, scale = "row", annotation_col = annotation_col, 
+         show_colnames = FALSE, main = "Top 50 DEG Heatmap", fontsize_row = 7)
+
+#PART K. MENYIMPAN HASIL 
+
+write.csv(topTableResults, "Hasil_GSE19804_DEG.csv", row.names = FALSE)
+
+#PART L. ANALISIS GO DAN KEGG
+
+# Ambil list Entrez ID yang signifikan
+sig_genes <- topTableResults %>% 
+  filter(adj.P.Val < 0.05 & abs(logFC) > 1) %>% 
+  pull(ENTREZID) %>% na.omit() %>% as.character()
+
+# Analisis GO (Biological Process)
+ego <- enrichGO(gene = sig_genes, OrgDb = org.Hs.eg.db, ont = "BP", readable = TRUE)
+dotplot(ego, showCategory=15) + ggtitle("GO Enrichment GSE19804")
+
+# Analisis KEGG
+ekegg <- enrichKEGG(gene = sig_genes, organism = 'hsa')
+barplot(ekegg, showCategory=15) + ggtitle("KEGG Pathway GSE19804")
+
+message("Analisis Selesai! Semua file dan plot telah diperbarui.")
